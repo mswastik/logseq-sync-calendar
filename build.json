@@ -1,0 +1,6 @@
+{
+  "watch": {
+    "include": "src/**",
+    "clearScreen": false
+  }
+}
