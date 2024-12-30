@@ -101,6 +101,7 @@ async function fetchICSData(url: string): Promise<ICAL.Component | null> {
 interface CalendarEvent {
   pageName: string;
   content: string;
+  uid: string;
 }
 
 function isAllDayEvent(content: string): boolean {
@@ -155,6 +156,7 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
 
   for (const event of events) {
     const vevent = new ICAL.Event(event);
+    const uid = vevent.uid;
 
     if (vevent.startDate.isDate && vevent.endDate.isDate) {
       console.log(`Processing multi-day all-day event: ${vevent.summary}`);
@@ -169,6 +171,7 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
         eventMap.set(`${dayOriginalName}-${eventContent}`, {
           pageName: dayOriginalName,
           content: eventContent,
+          uid
         });
 
         currentDate.addDuration(ICAL.Duration.fromString('P1D'));
@@ -187,6 +190,7 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
       eventMap.set(`${originalName}-${eventContent}`, {
         pageName: originalName,
         content: eventContent,
+        uid
       });
     }
   }
@@ -194,14 +198,14 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
   return eventMap;
 }
 
-async function addNewEvents(eventMap: Map<string, { pageName: string; content: string }>, targetHeader: string) {
-  const eventsByPage = Array.from(eventMap.values()).reduce((acc, { pageName, content }) => {
+async function addNewEvents(eventMap: Map<string, { pageName: string; content: string; uid: string }>, targetHeader: string) {
+  const eventsByPage = Array.from(eventMap.values()).reduce((acc, { pageName, content, uid }) => {
     if (!acc[pageName]) acc[pageName] = [];
-    acc[pageName].push(content);
+    acc[pageName].push({ content, uid });
     return acc;
-  }, {} as Record<string, string[]>);
+  }, {} as Record<string, Array<{ content: string; uid: string }>>);
 
-  for (const [pageName, eventContents] of Object.entries(eventsByPage)) {
+  for (const [pageName, events] of Object.entries(eventsByPage)) {
     console.log(`Processing journal page: ${pageName}`);
     const page = await logseq.Editor.getPage(pageName) as PageEntity | null;
     if (!page) {
@@ -218,50 +222,52 @@ async function addNewEvents(eventMap: Map<string, { pageName: string; content: s
     }
 
     // Sort events
-    const allDayEvents: string[] = [];
-    const timedEvents: { time: string; content: string }[] = [];
-
-    for (const eventContent of eventContents) {
-      if (eventContent.includes('All Day')) {
-        allDayEvents.push(eventContent);
-      } else {
-        const timeMatch = eventContent.match(/📅 (\d{4}) - /);
-        if (timeMatch) {
-          timedEvents.push({ time: timeMatch[1], content: eventContent });
-        }
-      }
-    }
-
-    // Sort and combine events
-    const sortedEvents = sortCalendarEvents([...allDayEvents, ...timedEvents.map(event => event.content)]);
+    const sortedEvents = sortCalendarEvents(events.map(e => e.content));
 
     // Create new blocks for events that don't exist
     for (const eventContent of sortedEvents) {
       console.log(`Checking event: ${eventContent}`);
       
+      // Find the corresponding event with UID
+      const event = events.find(e => e.content === eventContent);
+      if (!event) continue;
+
       // Check if any existing block has this content
       const existingBlocks = (targetBlock.children || []).filter((child: any) => {
         const childContent = 'content' in child ? child.content : child[1];
-        // Split content at newline to ignore any references or properties
         const cleanChildContent = childContent.split('\n')[0];
         const cleanEventContent = eventContent.split('\n')[0];
-        
-        console.log('Comparing contents:', {
-          clean_child: cleanChildContent,
-          clean_event: cleanEventContent,
-          matches: normalizeEventName(cleanChildContent) === normalizeEventName(cleanEventContent)
-        });
         
         return normalizeEventName(cleanChildContent) === normalizeEventName(cleanEventContent);
       });
 
       if (existingBlocks.length === 0) {
         console.log(`Creating new block for event: ${eventContent}`);
-        await logseq.Editor.insertBlock(
-          targetBlock.uuid,
-          eventContent,
-          { sibling: false }
-        );
+        try {
+          const newBlock = await logseq.Editor.insertBlock(
+            targetBlock.uuid,
+            eventContent,
+            { sibling: false }
+          );
+
+          // Add the UID as a block property with additional error handling
+          if (newBlock && newBlock.uuid) {
+            console.log(`Setting ics-uid property for block ${newBlock.uuid}: ${event.uid}`);
+            try {
+              await logseq.Editor.upsertBlockProperty(
+                newBlock.uuid,
+                'ics-uid',
+                event.uid
+              );
+            } catch (error) {
+              console.error('Failed to set ics-uid property:', error);
+            }
+          } else {
+            console.warn('New block creation failed or block has no UUID');
+          }
+        } catch (error) {
+          console.error('Failed to create new block:', error);
+        }
       } else {
         console.log(`Event already exists: ${eventContent}`);
       }

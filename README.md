@@ -39,6 +39,14 @@ The plugin can be configured through the plugin settings:
 1. Add your ICS calendar URL(s) in the plugin settings
 2. Create a "### Daily Plan" section in your journal template (or customize the header in settings)
 3. Click the "Sync Calendar" button in the command palette (cmd/ctrl + shift + p)
+4. Go into Settings > custom.edn and modify the following setting to hide the ics-uid property:
+
+```
+ ;; Hide specific block properties.
+ ;; Example usage:
+ ;; :block-hidden-properties #{:public :icon}
+ :block-hidden-properties #{:ics-uid}
+```
 
 ### Features
 
