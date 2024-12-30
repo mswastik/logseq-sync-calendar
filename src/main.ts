@@ -6,6 +6,17 @@ import {
 } from '@logseq/libs/dist/LSPlugin.user';
 import ICAL from 'ical.js';
 
+const LOG_MESSAGES = {
+  SKIPPING_REFERENCES: (content: string, count: number) => 
+    `⏩ Skipping block with references: ${content}\n- References found in ${count - 1} other blocks`,
+  KEEPING_BLOCK: (reasons: string[]) => 
+    `⏩ Keeping block because:${reasons.join('')}`,
+  STRIKING_THROUGH: (content: string) => 
+    `✏️ Striking through removed calendar event: ${content}`,
+  DELETING_EVENT: (content: string) => 
+    `🗑️ Deleting removed calendar event: ${content}`,
+} as const;
+
 const settingsSchema: SettingSchemaDesc[] = [
   {
     key: 'targetBlock',
@@ -115,16 +126,58 @@ function formatTime(date: Date): string {
   }).replace(':', '');
 }
 
-// Add this utility function
+// Add this utility function to clean markdown formatting
+function cleanMarkdownFormatting(text: string): string {
+  // Handle strikethrough
+  if (text.startsWith('~~') && text.endsWith('~~')) {
+    text = text.slice(2, -2);
+  }
+  
+  // Handle bold
+  if (text.startsWith('**') && text.endsWith('**')) {
+    text = text.slice(2, -2);
+  }
+  
+  // Handle italic
+  if ((text.startsWith('*') && text.endsWith('*')) || 
+      (text.startsWith('_') && text.endsWith('_'))) {
+    text = text.slice(1, -1);
+  }
+  
+  // Handle highlight
+  if (text.startsWith('==') && text.endsWith('==')) {
+    text = text.slice(2, -2);
+  }
+  
+  return text;
+}
+
+// Update isCalendarEvent to use the new function
+function isCalendarEvent(content: string): boolean {
+  const { cleanContent } = getFirstLineContent(content);
+  
+  console.log('Checking if calendar event:', {
+    content,
+    cleanContent,
+    safeMode: logseq.settings?.safeMode,
+    result: cleanContent.startsWith('📅')
+  });
+  
+  return cleanContent.startsWith('📅');
+}
+
+// Update getEventSortKey to use the new function
 function getEventSortKey(content: string): { isAllDay: boolean; time: string; name: string } {
-  const isAllDay = isAllDayEvent(content);
+  const { cleanContent } = getFirstLineContent(content);
+
+  const isAllDay = isAllDayEvent(cleanContent);
   let time = '';
   let name = '';
 
   if (isAllDay) {
-    name = normalizeEventName(content.split('All Day:')[1]);
+    name = normalizeEventName(cleanContent.split('All Day:')[1]);
   } else {
-    const match = content.match(/📅 (\d{4}) - (\d{4}): (.+)/);
+    const match = cleanContent.match(/📅 (\d{4}) - (\d{4}): (.+)/);
     if (match) {
       time = match[1];
       name = normalizeEventName(match[3]);
@@ -134,11 +187,16 @@ function getEventSortKey(content: string): { isAllDay: boolean; time: string; na
   return { isAllDay, time, name };
 }
 
-// Then simplify compareEvents to use this
+// Update compareEvents to handle markdown in struck-through check
 function compareEvents(a: string, b: string): number {
-  const aKey = getEventSortKey(a);
-  const bKey = getEventSortKey(b);
+  const { firstLine: aFirstLine, cleanContent: aClean } = getFirstLineContent(a);
+  const { firstLine: bFirstLine, cleanContent: bClean } = getFirstLineContent(b);
   
+  // Get sort keys using cleaned content
+  const aKey = getEventSortKey(aClean);
+  const bKey = getEventSortKey(bClean);
+  
+  // Normal sorting based on event type and time
   if (aKey.isAllDay !== bKey.isAllDay) {
     return aKey.isAllDay ? -1 : 1;
   }
@@ -232,16 +290,27 @@ async function addNewEvents(eventMap: Map<string, { pageName: string; content: s
       const event = events.find(e => e.content === eventContent);
       if (!event) continue;
 
-      // Check if any existing block has this content
-      const existingBlocks = (targetBlock.children || []).filter((child: any) => {
-        const childContent = 'content' in child ? child.content : child[1];
-        const cleanChildContent = childContent.split('\n')[0];
-        const cleanEventContent = eventContent.split('\n')[0];
+      // Check if any existing block has this UID
+      const existingBlocks = await Promise.all((targetBlock.children || []).map(async (child: any) => {
+        const uuid = 'uuid' in child ? child.uuid : child[1];
+        const block = await logseq.Editor.getBlock(uuid);
+        if (!block) return null;
         
-        return normalizeEventName(cleanChildContent) === normalizeEventName(cleanEventContent);
-      });
+        // Get the block's ics-uid property
+        const blockUid = await logseq.Editor.getBlockProperty(block.uuid, 'ics-uid');
+        
+        return {
+          block,
+          matches: blockUid === event.uid
+        };
+      }));
 
-      if (existingBlocks.length === 0) {
+      // Filter out null values and find matching block
+      const matchingBlock = existingBlocks
+        .filter((result): result is {block: BlockEntity; matches: boolean} => result !== null)
+        .find(result => result.matches);
+
+      if (!matchingBlock) {
         console.log(`Creating new block for event: ${eventContent}`);
         try {
           const newBlock = await logseq.Editor.insertBlock(
@@ -269,13 +338,19 @@ async function addNewEvents(eventMap: Map<string, { pageName: string; content: s
           console.error('Failed to create new block:', error);
         }
       } else {
-        console.log(`Event already exists: ${eventContent}`);
+        // If the content has changed but UID matches, update the content
+        if (normalizeEventName(matchingBlock.block.content.split('\n')[0]) !== normalizeEventName(eventContent)) {
+          console.log(`Updating existing block content for event with UID ${event.uid}`);
+          await logseq.Editor.updateBlock(matchingBlock.block.uuid, eventContent);
+        } else {
+          console.log(`Event already exists with UID: ${event.uid}`);
+        }
       }
     }
   }
 }
 
-async function deleteEvents(targetBlock: BlockEntity, sortedEvents: string[]) {
+async function deleteEvents(targetBlock: BlockEntity, eventMap: Map<string, CalendarEvent>) {
   console.log('\nChecking blocks for deletion...');
   
   const updatedTargetBlock = await logseq.Editor.getBlock(targetBlock.uuid) as BlockEntity;
@@ -285,67 +360,49 @@ async function deleteEvents(targetBlock: BlockEntity, sortedEvents: string[]) {
   }
 
   const childBlocks = await getChildBlocks(updatedTargetBlock);
-  console.log('Current sorted events:', sortedEvents);
+  
+  // Create a set of UIDs from the eventMap for faster lookup
+  const validUids = new Set(Array.from(eventMap.values()).map(event => event.uid));
 
   for (const block of childBlocks) {
-    if (!block) continue;
+    if (!block || !isCalendarEvent(block.content)) continue;
     
-    if (isCalendarEvent(block.content)) {
-      const content = block.content.trim();
-      
-      // Query for any blocks that reference this block
+    // Get the block's ics-uid property
+    const blockUid = await logseq.Editor.getBlockProperty(block.uuid, 'ics-uid');
+    
+    // If block has no UID or UID is not in current ICS data
+    if (!blockUid || !validUids.has(blockUid)) {
+      // Check for references/embeds
       const query = `[:find (pull ?b [*])
                      :where
                      [?b :block/content ?content]
                      [(clojure.string/includes? ?content "${block.uuid}")]]`;
       
       const results = await logseq.DB.datascriptQuery(query);
-      const hasReferences = results && results.length > 1; // More than 1 because the block itself contains its UUID
-
-      if (hasReferences) {
-        console.log(`⏩ Skipping block with references: ${content}`);
-        console.log(`- References found in ${results.length - 1} other blocks`);
-        continue;
-      }
-
-      const isInSortedEvents = sortedEvents.some(event => {
-        if (isAllDayEvent(content) && isAllDayEvent(event)) {
-          const currentEventName = normalizeEventName(content.split('All Day:')[1]);
-          const sortedEventName = normalizeEventName(event.split('All Day:')[1]);
-          return currentEventName === sortedEventName;
-        }
-
-        // Extract time and summary from both events for comparison
-        const currentMatch = content.match(/📅 (\d{4}) - (\d{4}): (.+)/);
-        const sortedMatch = event.match(/📅 (\d{4}) - (\d{4}): (.+)/);
-        
-        if (currentMatch && sortedMatch) {
-          const currentTime = currentMatch[1];
-          const currentSummary = normalizeEventName(currentMatch[3]);
-          const sortedTime = sortedMatch[1];
-          const sortedSummary = normalizeEventName(sortedMatch[3]);
-          
-          return currentTime === sortedTime && currentSummary === sortedSummary;
-        }
-        
-        return false;
-      });
-
-      const hasChildren = (block.children || []).length > 0;
+      const hasReferences = results && results.length > 1;
       
-      if (!isInSortedEvents && !hasChildren && !hasReferences) {
+      // Check for children
+      const hasChildren = (block.children || []).length > 0;
+
+      if (!hasChildren && !hasReferences) {
+        const content = block.content;
         if (logseq.settings?.safeMode) {
-          console.log(`✏️ Striking through removed calendar event: ${content}`);
-          // Split content to preserve properties
-          const [eventLine, ...properties] = content.split('\n');
-          const newContent = [`~~${eventLine}~~`, ...properties].join('\n');
+          console.log(LOG_MESSAGES.STRIKING_THROUGH(content));
+          // Get first line and rest of content
+          const [firstLine, ...rest] = content.split('\n');
+          // Only strikethrough the first line if it isn't already
+          const newFirstLine = firstLine.startsWith('~~') ? firstLine : `~~${firstLine}~~`;
+          const newContent = [newFirstLine, ...rest].join('\n');
           await logseq.Editor.updateBlock(block.uuid, newContent);
         } else {
-          console.log(`🗑️ Deleting removed calendar event: ${content}`);
+          console.log(LOG_MESSAGES.DELETING_EVENT(content));
           await logseq.Editor.removeBlock(block.uuid);
         }
       } else {
-        console.log(`⏩ Keeping block because:${isInSortedEvents ? ' in sorted events' : ''}${hasChildren ? ' has children' : ''}${hasReferences ? ' has references' : ''}`);
+        const reasons = [];
+        if (hasChildren) reasons.push(' has children');
+        if (hasReferences) reasons.push(' has references');
+        console.log(LOG_MESSAGES.KEEPING_BLOCK(reasons));
       }
     }
   }
@@ -354,31 +411,50 @@ async function deleteEvents(targetBlock: BlockEntity, sortedEvents: string[]) {
 async function reorderEvents(targetBlock: BlockEntity) {
   console.log('\nReordering blocks...');
   
-  // Get fresh block data
   const updatedTargetBlock = await logseq.Editor.getBlock(targetBlock.uuid) as BlockEntity;
   if (!updatedTargetBlock) {
     console.log('Could not fetch updated Target block');
     return;
   }
 
-  // Use utility function to get child blocks
   const childBlocks = await getChildBlocks(updatedTargetBlock);
+  console.log('All child blocks:', childBlocks.map(b => ({
+    content: b?.content,
+    uuid: b?.uuid
+  })));
 
-  // Filter and sort calendar event blocks
-  const calendarBlocks = childBlocks.filter(block => block && isCalendarEvent(block.content));
-  const sortedBlocks = calendarBlocks.sort((a, b) => {
-    if (!a || !b) return 0;
-    return compareEvents(a.content, b.content);
-  });
+  // Filter calendar events and sort them
+  const calendarBlocks = childBlocks
+    .filter(block => {
+      const isCalendar = block && isCalendarEvent(block.content);
+      console.log('Filtering block:', {
+        content: block?.content,
+        isCalendarEvent: isCalendar
+      });
+      return block && isCalendar;
+    })
+    .sort((a, b) => {
+      if (!a || !b) return 0;
+      const result = compareEvents(a.content, b.content);
+      console.log('Comparing blocks:', {
+        a: a.content,
+        b: b.content,
+        result
+      });
+      return result;
+    });
 
-  console.log('Blocks to reorder:', sortedBlocks.map(b => b?.content));
+  console.log('Calendar blocks after filtering:', calendarBlocks.map(b => ({
+    content: b?.content,
+    uuid: b?.uuid
+  })));
 
   // Reorder blocks
-  for (let i = sortedBlocks.length - 1; i >= 0; i--) {
-    const block = sortedBlocks[i];
+  for (let i = calendarBlocks.length - 1; i >= 0; i--) {
+    const block = calendarBlocks[i];
     if (!block) continue;
     
-    console.log(`Moving block: ${block.content}`);
+    console.log(`Moving block: ${block.content} (UUID: ${block.uuid})`);
     
     // First ensure block is a child of Target block
     await logseq.Editor.moveBlock(
@@ -391,10 +467,10 @@ async function reorderEvents(targetBlock: BlockEntity) {
     );
 
     // Then position it correctly among siblings
-    if (i < sortedBlocks.length - 1) {
+    if (i < calendarBlocks.length - 1) {
       const currentSibling = await logseq.Editor.getNextSiblingBlock(block.uuid);
       if (currentSibling) {
-        console.log(`Moving before sibling: ${currentSibling.content}`);
+        console.log(`Moving before sibling: ${currentSibling.content} (UUID: ${currentSibling.uuid})`);
         await logseq.Editor.moveBlock(
           block.uuid,
           currentSibling.uuid,
@@ -421,21 +497,6 @@ async function getChildBlocks(parentBlock: BlockEntity): Promise<BlockEntity[]> 
   return children.filter((block): block is BlockEntity => block !== null);
 }
 
-// Utility function for checking if a block is a calendar event
-function isCalendarEvent(content: string): boolean {
-  // Get the first line of content
-  const firstLine = content.split('\n')[0];
-  const isStruckThrough = firstLine.startsWith('~~') && firstLine.endsWith('~~');
-  
-  // If struck through and safe mode is off, check the content inside ~~
-  if (isStruckThrough && !logseq.settings?.safeMode) {
-    const innerContent = firstLine.slice(2, -2); // Remove ~~ from start and end
-    return innerContent.startsWith('📅');
-  }
-  
-  return firstLine.startsWith('📅');
-}
-
 function normalizeEventName(str: string): string {
   return str.toLowerCase().trim().replace(/\s+/g, ' ');
 }
@@ -445,6 +506,19 @@ function findDailyPlanBlock(blocks: BlockEntity[], targetHeader: string): BlockE
   return blocks.find((block: BlockEntity) => 
     normalizeEventName(block.content) === normalizeEventName(targetHeader)
   );
+}
+
+// Add this utility function
+function getFirstLineContent(content: string): { firstLine: string; cleanContent: string } {
+  const firstLine = content.split('\n')[0];
+  const cleanContent = cleanMarkdownFormatting(firstLine);
+  return { firstLine, cleanContent };
+}
+
+// Add this utility function
+async function getBlockWithUid(block: BlockEntity): Promise<{ block: BlockEntity; uid: string | null }> {
+  const uid = await logseq.Editor.getBlockProperty(block.uuid, 'ics-uid');
+  return { block, uid };
 }
 
 function main() {
@@ -540,7 +614,7 @@ function main() {
 
       // Process events
       console.log('Deleting old events...');
-      await deleteEvents(targetBlock, sortedEvents);
+      await deleteEvents(targetBlock, eventMap);
       console.log('Reordering events...');
       await reorderEvents(targetBlock);
     }
