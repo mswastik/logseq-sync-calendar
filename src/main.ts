@@ -6,11 +6,6 @@ import {
 } from '@logseq/libs/dist/LSPlugin.user';
 import ICAL from 'ical.js';
 
-interface PageReference {
-  id: number;
-  uuid: string;
-}
-
 const settingsSchema: SettingSchemaDesc[] = [
   {
     key: 'targetBlock',
@@ -110,10 +105,6 @@ interface CalendarEvent {
 
 function isAllDayEvent(content: string): boolean {
   return content.includes('All Day');
-}
-
-function extractEventTime(content: string): string {
-  return content.match(/📅 (\d{4})/)?.[1] || '';
 }
 
 function formatTime(date: Date): string {
@@ -448,46 +439,6 @@ function findDailyPlanBlock(blocks: BlockEntity[], targetHeader: string): BlockE
   return blocks.find((block: BlockEntity) => 
     normalizeEventName(block.content) === normalizeEventName(targetHeader)
   );
-}
-
-function eventsMatch(event1: string, event2: string): boolean {
-  const key1 = getEventSortKey(event1);
-  const key2 = getEventSortKey(event2);
-  
-  return key1.isAllDay === key2.isAllDay && 
-         key1.time === key2.time && 
-         key1.name === key2.name;
-}
-
-async function handleAsyncOperation<T>(
-  operation: () => Promise<T>,
-  errorMessage: string
-): Promise<T | null> {
-  try {
-    return await operation();
-  } catch (error) {
-    console.error(errorMessage, error);
-    logseq.UI.showMsg(errorMessage, 'error');
-    return null;
-  }
-}
-
-function processEventsForPage(events: string[]): string[] {
-  const allDayEvents: string[] = [];
-  const timedEvents: { time: string; content: string }[] = [];
-
-  for (const event of events) {
-    if (isAllDayEvent(event)) {
-      allDayEvents.push(event);
-    } else {
-      const timeMatch = event.match(/📅 (\d{4}) - /);
-      if (timeMatch) {
-        timedEvents.push({ time: timeMatch[1], content: event });
-      }
-    }
-  }
-
-  return sortCalendarEvents([...allDayEvents, ...timedEvents.map(e => e.content)]);
 }
 
 function main() {

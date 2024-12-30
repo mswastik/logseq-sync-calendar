@@ -32,5 +32,13 @@
   "logseq": {
     "id": "logseq-sync-calendar",
     "icon": "icon.svg"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/needo37/logseq-sync-calendar.git"
+  },
+  "bugs": {
+    "url": "https://github.com/needo37/logseq-sync-calendar/issues"
+  },
+  "homepage": "https://github.com/needo37/logseq-sync-calendar#readme"
 }
