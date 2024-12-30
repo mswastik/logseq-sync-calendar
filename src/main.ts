@@ -1,8 +1,7 @@
 import '@logseq/libs';
 import { 
   BlockEntity,
-  SettingSchemaDesc,
-  PageEntity
+  SettingSchemaDesc
 } from '@logseq/libs/dist/LSPlugin.user';
 import ICAL from 'ical.js';
 
@@ -27,20 +26,6 @@ const settingsSchema: SettingSchemaDesc[] = [
     default: true,
     description: 'Automatically sync calendar when new journal pages are created',
     title: 'Auto-sync on New Journal Pages',
-  },
-  {
-    key: 'enableScheduledSync',
-    type: 'boolean',
-    default: false,
-    description: 'Enable automatic calendar sync at scheduled intervals',
-    title: 'Enable Scheduled Sync',
-  },
-  {
-    key: 'syncInterval',
-    type: 'number',
-    default: 30,
-    description: 'How often to sync calendar (in minutes)',
-    title: 'Sync Interval',
   },
   {
     key: 'icsUrl1',
@@ -159,20 +144,40 @@ const LOG_MESSAGES = {
     'Adding new events...',
   FOUND_PAGES: (count: number) => 
     `Found ${count} journal pages to process`,
-  INVALID_INTERVAL: () => 
-    'Invalid sync interval, using default of 30 minutes',
-  SCHEDULER_SETUP: (minutes: number) => 
-    `Setting up scheduled sync every ${minutes} minutes`,
-  RUNNING_SCHEDULED: () => 
-    'Running scheduled sync...',
-  SCHEDULER_FAIL: (error: Error) => 
-    `Failed to run scheduled sync: ${error}`,
-  SETTINGS_CHANGED: () => 
-    'Settings changed, updating scheduler',
   NEW_JOURNAL_PAGE: (name: string) => 
     `New journal page detected: ${name}`,
   SYNC_FAIL: (error: Error) => 
-    `Failed to sync on new journal page: ${error}`
+    `Failed to sync on new journal page: ${error}`,
+  EXITING_EDIT_MODE: (blockUuid: string) => 
+    `Attempting to exit edit mode for block: ${blockUuid}`,
+  EDIT_MODE_EXIT_SUCCESS: (blockUuid: string) => 
+    `Successfully exited edit mode for block: ${blockUuid}`,
+  EDIT_MODE_EXIT_FAIL: (blockUuid: string, error: Error) => 
+    `Failed to exit edit mode for block ${blockUuid}: ${error}`,
+  BLOCK_OPERATION_START: (operation: string, content: string) => 
+    `Starting ${operation} for block: ${content}`,
+  BLOCK_OPERATION_END: (operation: string, content: string) => 
+    `Completed ${operation} for block: ${content}`,
+  NO_REORDER_SINGLE_BLOCK: () => 
+    'No reordering needed - one or fewer blocks',
+  NO_REORDER_SINGLE_EVENT: () => 
+    'No reordering needed - one or fewer calendar events',
+  NO_REORDER_CORRECT_ORDER: () => 
+    'No reordering needed - blocks already in correct order',
+  CHECKING_BLOCK_ORDER: (block: BlockEntity, index: number, currentUuid: string | undefined) => 
+    `Checking block order: Block ${block.uuid} at index ${index}, current sibling: ${currentUuid}`,
+  TARGET_BLOCK_NOT_FOUND: () => 
+    'Could not fetch updated Target block',
+  REORDER_NEEDED: () => 
+    'Reordering needed - blocks not in correct order',
+  BLOCK_CREATED: (uuid: string) => 
+    `Block created with UUID: ${uuid}`,
+  BLOCK_UPDATED: (uuid: string) => 
+    `Block updated with UUID: ${uuid}`,
+  CURRENT_EDITING_BLOCK: (uuid: string | null) => 
+    `Current editing block: ${uuid || 'none'}`,
+  ATTEMPTING_EXIT_ALL: () => 
+    'Attempting to exit all editing modes',
 } as const;
 
 function getOriginalNameForDate(date: Date): string {
@@ -207,7 +212,8 @@ interface CalendarEvent {
 }
 
 function isAllDayEvent(content: string): boolean {
-  return content.includes('All Day');
+  const { cleanContent } = getFirstLineContent(content);
+  return cleanContent.includes('All Day');
 }
 
 function formatTime(date: Date): string {
@@ -243,17 +249,9 @@ function cleanMarkdownFormatting(text: string): string {
   return text;
 }
 
-// Update isCalendarEvent to use the new function
+// Remove the logging from isCalendarEvent since it's a utility function
 function isCalendarEvent(content: string): boolean {
   const { cleanContent } = getFirstLineContent(content);
-  
-  console.log(LOG_MESSAGES.CHECKING_CALENDAR_EVENT({
-    content,
-    cleanContent,
-    safeMode: !!logseq.settings?.safeMode,
-    result: cleanContent.startsWith('📅')
-  }));
-  
   return cleanContent.startsWith('📅');
 }
 
@@ -268,10 +266,11 @@ function getEventSortKey(content: string): { isAllDay: boolean; time: string; na
   if (isAllDay) {
     name = normalizeEventName(cleanContent.split('All Day:')[1]);
   } else {
-    const match = cleanContent.match(/📅 (\d{4}) - (\d{4}): (.+)/);
+    // Updated regex to handle both ** and non-** formats
+    const match = cleanContent.match(/📅 (?:\*\*)?(\d{4}) - \d{4}(?:\*\*)?:(.+)/);
     if (match) {
       time = match[1];
-      name = normalizeEventName(match[3]);
+      name = normalizeEventName(match[2]);
     }
   }
 
@@ -280,22 +279,26 @@ function getEventSortKey(content: string): { isAllDay: boolean; time: string; na
 
 // Update compareEvents to handle markdown in struck-through check
 function compareEvents(a: string, b: string): number {
-  const { firstLine: aFirstLine, cleanContent: aClean } = getFirstLineContent(a);
-  const { firstLine: bFirstLine, cleanContent: bClean } = getFirstLineContent(b);
+  const { cleanContent: aClean } = getFirstLineContent(a);
+  const { cleanContent: bClean } = getFirstLineContent(b);
   
-  // Get sort keys using cleaned content
   const aKey = getEventSortKey(aClean);
   const bKey = getEventSortKey(bClean);
   
-  // Normal sorting based on event type and time
+  // All-day events come first
   if (aKey.isAllDay !== bKey.isAllDay) {
     return aKey.isAllDay ? -1 : 1;
   }
   
-  if (aKey.time !== bKey.time) {
-    return aKey.time.localeCompare(bKey.time);
+  // Compare times numerically
+  const aTime = parseInt(aKey.time || '2400');
+  const bTime = parseInt(bKey.time || '2400');
+  
+  if (aTime !== bTime) {
+    return aTime - bTime;
   }
   
+  // If times are equal, sort by name
   return aKey.name.localeCompare(bKey.name);
 }
 
@@ -314,7 +317,7 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
 
       while (currentDate.compare(endDate) <= 0) {
         const dayOriginalName = getOriginalNameForDate(currentDate.toJSDate());
-        const eventContent = `📅 All Day: ${vevent.summary || 'No Title'}`;
+        const eventContent = `📅 **All Day:** ${vevent.summary || 'No Title'}`;
 
         console.log(LOG_MESSAGES.ADDING_EVENT_FOR_DATE(dayOriginalName, eventContent));
         eventMap.set(`${dayOriginalName}-${eventContent}`, {
@@ -331,7 +334,7 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
       const endTime = vevent.endDate ? formatTime(vevent.endDate.toJSDate()) : '????';
 
       const eventContent = vevent.startDate.isDate
-        ? `📅 All Day: ${summary}`
+        ? `📅 **All Day:** ${summary}`
         : `📅 ${startTime} - ${endTime}: ${summary}`;
       const originalName = getOriginalNameForDate(vevent.startDate.toJSDate());
 
@@ -347,95 +350,141 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
   return eventMap;
 }
 
-async function addNewEvents(eventMap: Map<string, { pageName: string; content: string; uid: string }>, targetHeader: string) {
-  const eventsByPage = Array.from(eventMap.values()).reduce((acc, { pageName, content, uid }) => {
-    if (!acc[pageName]) acc[pageName] = [];
-    acc[pageName].push({ content, uid });
-    return acc;
-  }, {} as Record<string, Array<{ content: string; uid: string }>>);
+async function syncCalendar() {
+  const targetHeader = (logseq.settings?.targetBlock as string) || '### Daily Plan';
+  const urls: string[] = [
+    logseq.settings?.icsUrl1 as string, 
+    logseq.settings?.icsUrl2 as string,
+    logseq.settings?.icsUrl3 as string,
+    logseq.settings?.icsUrl4 as string
+  ].filter(Boolean);
 
-  for (const [pageName, events] of Object.entries(eventsByPage)) {
-    console.log(`Processing journal page: ${pageName}`);
-    const page = await logseq.Editor.getPage(pageName) as PageEntity | null;
-    if (!page) {
-      console.warn(LOG_MESSAGES.JOURNAL_NOT_FOUND(pageName));
-      continue;
+  if (urls.length === 0) {
+    logseq.UI.showMsg('No ICS URLs configured.', 'error');
+    return;
+  }
+
+  // Process ICS files and get events
+  const eventMap = new Map<string, CalendarEvent>();
+  let successfulFetches = 0;
+  
+  for (const url of urls) {
+    console.log(LOG_MESSAGES.PROCESSING_URL(url));
+    const icsData = await fetchICSData(url);
+    if (icsData) {
+      console.log(LOG_MESSAGES.ICS_FETCH_SUCCESS());
+      const events = await processICSEvents(icsData);
+      console.log(LOG_MESSAGES.PROCESSED_EVENTS(Array.from(events.values())));
+      events.forEach((value, key) => eventMap.set(key, value));
+      successfulFetches++;
     }
+  }
 
+  if (successfulFetches === 0) {
+    logseq.UI.showMsg(LOG_MESSAGES.FETCH_FAIL(), 'error');
+    return;
+  }
+
+  console.log(LOG_MESSAGES.ADDING_EVENTS());
+
+  // Get all journal pages
+  const allPages = await logseq.Editor.getAllPages() ?? [];
+  const journalPages = allPages.filter(page => page?.['journal?'] || page?.journal);
+  console.log(LOG_MESSAGES.FOUND_PAGES(journalPages.length));
+
+  // Process each journal page
+  for (const page of journalPages) {
+    console.log(LOG_MESSAGES.PROCESSING_PAGE(page.name));
+    
     const blocks = await logseq.Editor.getPageBlocksTree(page.name) as BlockEntity[];
     const targetBlock = findDailyPlanBlock(blocks, targetHeader);
 
     if (!targetBlock) {
-      console.log(LOG_MESSAGES.NO_TARGET_BLOCK());
+      console.log(LOG_MESSAGES.SKIPPING_PAGE_NO_TARGET(page.name));
       continue;
     }
 
-    // Sort events
-    const sortedEvents = sortCalendarEvents(events.map(e => e.content));
+    // Get events for this page
+    const pageEvents = Array.from(eventMap.values())
+      .filter(e => normalizeEventName(e.pageName) === normalizeEventName(page.name))
+      .map(e => ({ content: e.content, uid: e.uid }));
 
-    // Create new blocks for events that don't exist
-    for (const eventContent of sortedEvents) {
-      console.log(LOG_MESSAGES.CHECKING_EVENT(eventContent));
+    // Add new events and handle updates
+    await addNewEvents(targetBlock, pageEvents);
+    
+    // Delete removed events and reorder
+    await deleteEvents(targetBlock, eventMap);
+    await reorderEvents(targetBlock);
+  }
+
+  logseq.UI.showMsg(LOG_MESSAGES.SYNC_COMPLETE());
+}
+
+// Update addNewEvents to take targetBlock directly
+async function addNewEvents(targetBlock: BlockEntity, events: Array<{ content: string; uid: string }>) {
+  // Sort events
+  const sortedEvents = sortCalendarEvents(events.map(e => e.content));
+  
+  // Create new blocks for events that don't exist
+  for (const [index, eventContent] of sortedEvents.entries()) {
+    const isLastEvent = index === sortedEvents.length - 1;
+    console.log(LOG_MESSAGES.CHECKING_EVENT(eventContent));
+    
+    // Find the corresponding event with UID
+    const event = events.find(e => e.content === eventContent);
+    if (!event) continue;
+
+    // Format the content with markdown inline
+    const formattedContent = isAllDayEvent(eventContent)
+      ? eventContent.replace(/(📅 )(All Day:)(.+)/, '$1**$2**$3')
+      : eventContent.replace(/(📅 )(\d{4}) - (\d{4}:)(.+)/, '$1**$2 - $3**$4');
+
+    // Check if any existing block has this UID
+    const existingBlocks = await Promise.all((targetBlock.children || []).map(async (child: any) => {
+      const uuid = 'uuid' in child ? child.uuid : child[1];
+      const block = await logseq.Editor.getBlock(uuid);
+      if (!block) return null;
       
-      // Find the corresponding event with UID
-      const event = events.find(e => e.content === eventContent);
-      if (!event) continue;
+      // Get the block's ics-uid property
+      const blockUid = await logseq.Editor.getBlockProperty(block.uuid, 'ics-uid');
+      
+      return {
+        block,
+        matches: blockUid === event.uid
+      };
+    }));
 
-      // Check if any existing block has this UID
-      const existingBlocks = await Promise.all((targetBlock.children || []).map(async (child: any) => {
-        const uuid = 'uuid' in child ? child.uuid : child[1];
-        const block = await logseq.Editor.getBlock(uuid);
-        if (!block) return null;
-        
-        // Get the block's ics-uid property
-        const blockUid = await logseq.Editor.getBlockProperty(block.uuid, 'ics-uid');
-        
-        return {
-          block,
-          matches: blockUid === event.uid
-        };
-      }));
+    // Filter out null values and find matching block
+    const matchingBlock = existingBlocks
+      .filter((result): result is {block: BlockEntity; matches: boolean} => result !== null)
+      .find(result => result.matches);
 
-      // Filter out null values and find matching block
-      const matchingBlock = existingBlocks
-        .filter((result): result is {block: BlockEntity; matches: boolean} => result !== null)
-        .find(result => result.matches);
+    if (!matchingBlock) {
+      try {
+        const newBlock = await logseq.Editor.insertBlock(
+          targetBlock.uuid,
+          formattedContent,
+          { sibling: false }
+        );
 
-      if (!matchingBlock) {
-        console.log(LOG_MESSAGES.CREATING_BLOCK(eventContent));
-        try {
-          const newBlock = await logseq.Editor.insertBlock(
-            targetBlock.uuid,
-            eventContent,
-            { sibling: false }
-          );
-
-          // Add the UID as a block property with additional error handling
-          if (newBlock && newBlock.uuid) {
-            console.log(LOG_MESSAGES.SETTING_UID(newBlock.uuid, event.uid));
-            try {
-              await logseq.Editor.upsertBlockProperty(
-                newBlock.uuid,
-                'ics-uid',
-                event.uid
-              );
-            } catch (error) {
-              console.error(LOG_MESSAGES.FAILED_SET_PROPERTY(error as Error));
-            }
-          } else {
-            console.warn(LOG_MESSAGES.BLOCK_CREATION_FAILED());
-          }
-        } catch (error) {
-          console.error(LOG_MESSAGES.FAILED_CREATE_BLOCK(error as Error));
+        if (newBlock && newBlock.uuid) {
+          const finishOperation = await logBlockOperation('creation', formattedContent, newBlock.uuid);
+          
+          await exitEditMode(newBlock.uuid);
+          await logseq.Editor.upsertBlockProperty(newBlock.uuid, 'ics-uid', event.uid);
+          await exitEditMode(newBlock.uuid, isLastEvent);
+          
+          await finishOperation();
         }
-      } else {
-        // If the content has changed but UID matches, update the content
-        if (normalizeEventName(matchingBlock.block.content.split('\n')[0]) !== normalizeEventName(eventContent)) {
-          console.log(LOG_MESSAGES.UPDATING_BLOCK(event.uid));
-          await logseq.Editor.updateBlock(matchingBlock.block.uuid, eventContent);
-        } else {
-          console.log(LOG_MESSAGES.EVENT_EXISTS(event.uid));
-        }
+      } catch (error) {
+        console.error(LOG_MESSAGES.FAILED_CREATE_BLOCK(error as Error));
+      }
+    } else {
+      if (normalizeEventName(matchingBlock.block.content.split('\n')[0]) !== normalizeEventName(eventContent)) {
+        const finishOperation = await logBlockOperation('update', formattedContent, matchingBlock.block.uuid);
+        await logseq.Editor.updateBlock(matchingBlock.block.uuid, formattedContent);
+        await exitEditMode(matchingBlock.block.uuid, isLastEvent);
+        await finishOperation();
       }
     }
   }
@@ -502,56 +551,76 @@ async function deleteEvents(targetBlock: BlockEntity, eventMap: Map<string, Cale
 async function reorderEvents(targetBlock: BlockEntity) {
   console.log(LOG_MESSAGES.REORDERING_EVENTS());
   
-  const updatedTargetBlock = await logseq.Editor.getBlock(targetBlock.uuid) as BlockEntity;
-  if (!updatedTargetBlock) {
-    console.log('Could not fetch updated Target block');
+  // Get all child blocks
+  const childBlocks = await getChildBlocks(targetBlock);
+  
+  // Filter calendar events with single logging
+  const calendarBlocks = childBlocks.filter(block => {
+    if (!block) return false;
+    const isCalendar = isCalendarEvent(block.content);
+    console.log(LOG_MESSAGES.FILTERING_BLOCK(block.content, isCalendar));
+    return isCalendar;
+  });
+  
+  // Early return if one or fewer calendar events
+  if (calendarBlocks.length <= 1) {
+    console.log('No reordering needed - one or fewer calendar events');
     return;
   }
 
-  const childBlocks = await getChildBlocks(updatedTargetBlock);
-  console.log(LOG_MESSAGES.CHILD_BLOCKS(childBlocks.map(b => ({
-    content: b?.content,
-    uuid: b?.uuid
-  }))));
-
-  // Filter calendar events and sort them
-  const calendarBlocks = childBlocks
-    .filter(block => {
-      const isCalendar = block && isCalendarEvent(block.content);
-      console.log(LOG_MESSAGES.FILTERING_BLOCK(block?.content, isCalendar));
-      return block && isCalendar;
-    })
-    .sort((a, b) => {
-      if (!a || !b) return 0;
-      const result = compareEvents(a.content, b.content);
-      console.log(LOG_MESSAGES.COMPARING_BLOCKS(a.content, b.content, result));
-      return result;
+  // Sort calendar blocks chronologically
+  const sortedCalendarBlocks = [...calendarBlocks].sort((a, b) => {
+    const result = compareEvents(a.content, b.content);
+    console.log(`Comparing blocks:`, {
+      blockA: {
+        time: getEventSortKey(a.content).time,
+        content: a.content
+      },
+      blockB: {
+        time: getEventSortKey(b.content).time,
+        content: b.content
+      },
+      result
     });
+    return result;
+  });
 
-  // Reorder blocks
-  for (let i = calendarBlocks.length - 1; i >= 0; i--) {
-    const block = calendarBlocks[i];
-    if (!block) continue;
-    
-    console.log(LOG_MESSAGES.MOVING_BLOCK(block.content, block.uuid));
-    
-    // First ensure block is a child of Target block
-    await logseq.Editor.moveBlock(block.uuid, targetBlock.uuid, {
-      before: false,
-      children: true
-    });
-
-    // Then position it correctly among siblings
-    if (i < calendarBlocks.length - 1) {
-      const currentSibling = await logseq.Editor.getNextSiblingBlock(block.uuid);
-      if (currentSibling) {
-        console.log(LOG_MESSAGES.MOVING_BEFORE_SIBLING(currentSibling.content, currentSibling.uuid));
-        await logseq.Editor.moveBlock(block.uuid, currentSibling.uuid, { before: true });
-      }
+  // Check if blocks are already in correct order
+  let needsReordering = false;
+  for (let i = 0; i < calendarBlocks.length; i++) {
+    if (calendarBlocks[i].uuid !== sortedCalendarBlocks[i].uuid) {
+      needsReordering = true;
+      break;
     }
   }
-  
-  console.log(LOG_MESSAGES.REORDER_COMPLETE());
+
+  if (!needsReordering) {
+    console.log('No reordering needed - blocks already in correct order');
+    return;
+  }
+
+  // Move blocks in chronological order
+  for (let i = 0; i < sortedCalendarBlocks.length; i++) {
+    const block = sortedCalendarBlocks[i];
+    
+    console.log(`Moving block ${i + 1}/${sortedCalendarBlocks.length}:`, {
+      time: getEventSortKey(block.content).time,
+      content: block.content,
+      isFirstBlock: i === 0
+    });
+    
+    if (i === 0) {
+      await logseq.Editor.moveBlock(block.uuid, targetBlock.uuid, {
+        before: false,
+        children: true
+      });
+    } else {
+      const prevBlock = sortedCalendarBlocks[i - 1];
+      await logseq.Editor.moveBlock(block.uuid, prevBlock.uuid, {
+        before: false
+      });
+    }
+  }
 }
 
 // Utility function for sorting events
@@ -586,10 +655,34 @@ function getFirstLineContent(content: string): { firstLine: string; cleanContent
   return { firstLine, cleanContent };
 }
 
-// Add this utility function
-async function getBlockWithUid(block: BlockEntity): Promise<{ block: BlockEntity; uid: string | null }> {
-  const uid = await logseq.Editor.getBlockProperty(block.uuid, 'ics-uid');
-  return { block, uid };
+// Add a utility function for waiting
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Create a utility function for common block operations logging
+async function logBlockOperation(operation: 'creation' | 'update', content: string, blockUuid: string) {
+  console.log(LOG_MESSAGES.BLOCK_OPERATION_START(operation, content));
+  console.log(LOG_MESSAGES.BLOCK_CREATED(blockUuid));
+  return async () => {
+    console.log(LOG_MESSAGES.BLOCK_OPERATION_END(operation, content));
+  };
+}
+
+// Create a utility function for exiting edit mode
+async function exitEditMode(blockUuid: string, isLastEvent: boolean = false) {
+  try {
+    await logseq.Editor.selectBlock(blockUuid);
+    await logseq.Editor.exitEditingMode();
+    
+    if (isLastEvent) {
+      await wait(50);
+    }
+    
+    await logseq.Editor.selectBlock(blockUuid);
+    await logseq.Editor.exitEditingMode();
+    console.log(LOG_MESSAGES.EDIT_MODE_EXIT_SUCCESS(blockUuid));
+  } catch (error) {
+    console.error(LOG_MESSAGES.EDIT_MODE_EXIT_FAIL(blockUuid, error as Error));
+  }
 }
 
 function main() {
@@ -600,10 +693,6 @@ function main() {
   // Clean up sync-calendar command and interval before registering new one
   logseq.beforeunload(async () => {
     console.log(LOG_MESSAGES.CLEANUP());
-    if (syncIntervalId) {
-      clearInterval(syncIntervalId);
-      syncIntervalId = null;
-    }
     await logseq.App.registerCommandPalette(
       {
         key: 'sync-calendar',
@@ -614,129 +703,17 @@ function main() {
   });
 
   logseq.useSettingsSchema(settingsSchema);
-  
-  // Extract sync logic into a reusable function
-  const syncCalendar = async () => {
-    const targetHeader = (logseq.settings?.targetBlock as string) || '### Daily Plan';
-    const urls: string[] = [
-      logseq.settings?.icsUrl1 as string, 
-      logseq.settings?.icsUrl2 as string,
-      logseq.settings?.icsUrl3 as string,
-      logseq.settings?.icsUrl4 as string
-    ].filter(Boolean);
 
-    if (urls.length === 0) {
-      logseq.UI.showMsg('No ICS URLs configured.', 'error');
-      return;
-    }
-
-    // Process ICS files and get events
-    const eventMap = new Map<string, CalendarEvent>();
-    let successfulFetches = 0;
-    
-    for (const url of urls) {
-      console.log(LOG_MESSAGES.PROCESSING_URL(url));
-      const icsData = await fetchICSData(url);
-      if (icsData) {
-        console.log(LOG_MESSAGES.ICS_FETCH_SUCCESS());
-        const events = await processICSEvents(icsData);
-        console.log(LOG_MESSAGES.PROCESSED_EVENTS(Array.from(events.values())));
-        events.forEach((value, key) => eventMap.set(key, value));
-        successfulFetches++;
-      }
-    }
-
-    if (successfulFetches === 0) {
-      logseq.UI.showMsg(LOG_MESSAGES.FETCH_FAIL(), 'error');
-      return;
-    }
-
-    console.log(LOG_MESSAGES.ADDING_EVENTS());
-    await addNewEvents(eventMap, targetHeader);
-
-    // Get all journal pages
-    const allPages = await logseq.Editor.getAllPages() ?? [];
-    const journalPages = allPages.filter(page => page?.['journal?'] || page?.journal);
-    console.log(LOG_MESSAGES.FOUND_PAGES(journalPages.length));
-
-    // Process each journal page
-    for (const page of journalPages) {
-      console.log(LOG_MESSAGES.PROCESSING_PAGE(page.name));
-      
-      const blocks = await logseq.Editor.getPageBlocksTree(page.name) as BlockEntity[];
-      const targetBlock = findDailyPlanBlock(blocks, targetHeader);
-
-      if (!targetBlock) {
-        console.log(LOG_MESSAGES.SKIPPING_PAGE_NO_TARGET(page.name));
-        continue;
-      }
-
-      // Get events for this page
-      const pageEvents = Array.from(eventMap.values())
-        .filter(e => normalizeEventName(e.pageName) === normalizeEventName(page.name))
-        .map(e => e.content);
-
-      console.log(LOG_MESSAGES.EVENTS_FOUND(pageEvents));
-      
-      // Sort events using utility function
-      const sortedEvents = sortCalendarEvents(pageEvents);
-      console.log(LOG_MESSAGES.SORTED_EVENTS(page.name, sortedEvents));
-
-      // Process events
-      await deleteEvents(targetBlock, eventMap);
-      await reorderEvents(targetBlock);
-    }
-
-    logseq.UI.showMsg(LOG_MESSAGES.SYNC_COMPLETE());
-  };
-
-  // Update scheduler to use the sync function directly
-  const updateScheduler = () => {
-    if (syncIntervalId) {
-      clearInterval(syncIntervalId);
-      syncIntervalId = null;
-    }
-
-    if (logseq.settings?.enableScheduledSync) {
-      let intervalMinutes = Number(logseq.settings?.syncInterval || 30);
-      if (isNaN(intervalMinutes) || intervalMinutes <= 0) {
-        console.warn(LOG_MESSAGES.INVALID_INTERVAL());
-        intervalMinutes = 30;
-      }
-      const interval = intervalMinutes * 60 * 1000;
-      
-      console.log(LOG_MESSAGES.SCHEDULER_SETUP(intervalMinutes));
-      syncIntervalId = setInterval(async () => {
-        console.log(LOG_MESSAGES.RUNNING_SCHEDULED());
-        try {
-          await syncCalendar();
-        } catch (error) {
-          console.error(LOG_MESSAGES.SCHEDULER_FAIL(error as Error));
-          logseq.UI.showMsg('Failed to sync calendar', 'error');
-        }
-      }, interval);
-    }
-  };
-
-  // Listen for settings changes
-  logseq.onSettingsChanged(() => {
-    console.log(LOG_MESSAGES.SETTINGS_CHANGED());
-    updateScheduler();
-  });
-
-  // Initial scheduler setup
-  updateScheduler();
-
-  // Register command palette to use the same sync function
+  // Register command palette to use the sync function
   logseq.App.registerCommandPalette(
     {
       key: 'sync-calendar',
       label: 'Sync Calendar',
     },
-    syncCalendar  // Use the same sync function
+    syncCalendar  // Use the existing sync function
   );
 
-  // Update page listener to use the same sync function
+  // Update page listener to use the sync function
   logseq.App.onPageHeadActionsSlotted(async ({ page }) => {
     if (page.journal && logseq.settings?.autoSync !== false) {
       console.log(LOG_MESSAGES.NEW_JOURNAL_PAGE(page.name));
