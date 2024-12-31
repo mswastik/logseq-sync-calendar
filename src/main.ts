@@ -317,7 +317,7 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
 
       while (currentDate.compare(endDate) <= 0) {
         const dayOriginalName = getOriginalNameForDate(currentDate.toJSDate());
-        const eventContent = `📅 **All Day:** ${vevent.summary || 'No Title'}`;
+        const eventContent = formatEventContent(vevent.summary);
 
         console.log(LOG_MESSAGES.ADDING_EVENT_FOR_DATE(dayOriginalName, eventContent));
         eventMap.set(`${dayOriginalName}-${eventContent}`, {
@@ -333,9 +333,7 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
       const startTime = formatTime(vevent.startDate.toJSDate());
       const endTime = vevent.endDate ? formatTime(vevent.endDate.toJSDate()) : '????';
 
-      const eventContent = vevent.startDate.isDate
-        ? `📅 **All Day:** ${summary}`
-        : `📅 ${startTime} - ${endTime}: ${summary}`;
+      const eventContent = formatEventContent(summary, startTime, endTime);
       const originalName = getOriginalNameForDate(vevent.startDate.toJSDate());
 
       console.log(LOG_MESSAGES.ADDING_SINGLE_EVENT(eventContent, originalName));
@@ -435,9 +433,7 @@ async function addNewEvents(targetBlock: BlockEntity, events: Array<{ content: s
     if (!event) continue;
 
     // Format the content with markdown inline
-    const formattedContent = isAllDayEvent(eventContent)
-      ? eventContent.replace(/(📅 )(All Day:)(.+)/, '$1**$2**$3')
-      : eventContent.replace(/(📅 )(\d{4}) - (\d{4}:)(.+)/, '$1**$2 - $3**$4');
+    const formattedContent = ensureMarkdownFormatting(eventContent);
 
     // Check if any existing block has this UID
     const existingBlocks = await Promise.all((targetBlock.children || []).map(async (child: any) => {
@@ -670,19 +666,37 @@ async function logBlockOperation(operation: 'creation' | 'update', content: stri
 // Create a utility function for exiting edit mode
 async function exitEditMode(blockUuid: string, isLastEvent: boolean = false) {
   try {
-    await logseq.Editor.selectBlock(blockUuid);
-    await logseq.Editor.exitEditingMode();
-    
+    await exitEditModeOnce(blockUuid);
     if (isLastEvent) {
       await wait(50);
+      await exitEditModeOnce(blockUuid);
     }
-    
-    await logseq.Editor.selectBlock(blockUuid);
-    await logseq.Editor.exitEditingMode();
     console.log(LOG_MESSAGES.EDIT_MODE_EXIT_SUCCESS(blockUuid));
   } catch (error) {
     console.error(LOG_MESSAGES.EDIT_MODE_EXIT_FAIL(blockUuid, error as Error));
   }
+}
+
+// Utility for formatting event content
+function formatEventContent(summary: string, startTime?: string, endTime?: string): string {
+  if (!startTime || !endTime) {
+    return `📅 **All Day:** ${summary || 'No Title'}`;
+  }
+  return `📅 ${startTime} - ${endTime}: ${summary || 'No Title'}`;
+}
+
+// Utility for ensuring markdown formatting
+function ensureMarkdownFormatting(content: string): string {
+  if (isAllDayEvent(content)) {
+    return content.replace(/(📅 )(All Day:)(.+)/, '$1**$2**$3');
+  }
+  return content.replace(/(📅 )(\d{4}) - (\d{4}:)(.+)/, '$1**$2 - $3**$4');
+}
+
+// Utility for exiting edit mode once
+async function exitEditModeOnce(blockUuid: string): Promise<void> {
+  await logseq.Editor.selectBlock(blockUuid);
+  await logseq.Editor.exitEditingMode();
 }
 
 function main() {
