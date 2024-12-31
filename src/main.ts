@@ -688,11 +688,11 @@ async function exitEditMode(blockUuid: string, isLastEvent: boolean = false) {
 function main() {
   console.log(LOG_MESSAGES.PLUGIN_LOADED());
   console.log(LOG_MESSAGES.SAFE_MODE_STATUS(!!logseq.settings?.safeMode));
-  let syncIntervalId: ReturnType<typeof setInterval> | null = null;
 
   // Clean up sync-calendar command and interval before registering new one
   logseq.beforeunload(async () => {
     console.log(LOG_MESSAGES.CLEANUP());
+    if (syncIntervalId) clearInterval(syncIntervalId);
     await logseq.App.registerCommandPalette(
       {
         key: 'sync-calendar',
@@ -704,27 +704,38 @@ function main() {
 
   logseq.useSettingsSchema(settingsSchema);
 
-  // Register command palette to use the sync function
+  // Register command palette for manual sync
   logseq.App.registerCommandPalette(
     {
       key: 'sync-calendar',
       label: 'Sync Calendar',
     },
-    syncCalendar  // Use the existing sync function
+    syncCalendar
   );
 
-  // Update page listener to use the sync function
-  logseq.App.onPageHeadActionsSlotted(async ({ page }) => {
-    if (page.journal && logseq.settings?.autoSync !== false) {
-      console.log(LOG_MESSAGES.NEW_JOURNAL_PAGE(page.name));
-      try {
-        await syncCalendar();
-      } catch (error) {
-        console.error(LOG_MESSAGES.SYNC_FAIL(error as Error));
-        logseq.UI.showMsg('Failed to sync calendar', 'error');
-      }
-    }
-  });
+  // Schedule daily sync at 12:01 AM
+  const scheduleNextSync = () => {
+    const now = new Date();
+    const nextSync = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1, // next day
+      0, // hour: 00
+      1, // minute: 01
+      0  // second: 00
+    );
+    
+    const msUntilNextSync = nextSync.getTime() - now.getTime();
+    console.log(`Next sync scheduled in ${Math.round(msUntilNextSync / 1000 / 60)} minutes`);
+    
+    return setTimeout(async () => {
+      await syncCalendar();
+      syncIntervalId = setInterval(syncCalendar, 24 * 60 * 60 * 1000); // Run every 24 hours after first sync
+    }, msUntilNextSync);
+  };
+
+  // Start the scheduling
+  let syncIntervalId = scheduleNextSync();
 }
 
 logseq.ready(main).catch(console.error);
