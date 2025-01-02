@@ -237,39 +237,87 @@ async function processICSEvents(icsData: ICAL.Component): Promise<Map<string, Ca
   const eventMap = new Map<string, CalendarEvent>();
   const events = icsData.getAllSubcomponents('vevent');
 
+  // Set a reasonable limit for recurring events (e.g., 7 days from now)
+  const futureLimit = new Date();
+  futureLimit.setDate(futureLimit.getDate() + 7);
+
   for (const event of events) {
     const vevent = new ICAL.Event(event);
     const uid = vevent.uid;
 
-    if (vevent.startDate.isDate && vevent.endDate.isDate) {
-      let currentDate = vevent.startDate.clone();
-      const endDate = vevent.endDate.clone();
+    // Handle recurring events
+    if (vevent.isRecurring()) {
+      const iterator = vevent.iterator();
+      let next: ICAL.Time | null;
+      
+      while ((next = iterator.next()) !== null) {
+        const startDate = next.toJSDate();
+        // Stop if we've gone too far into the future
+        if (startDate > futureLimit) break;
+       
+        // Skip if this occurrence is in an EXDATE
+        if (vevent.isRecurrenceException()) continue;
+        
+        const endDate = vevent.getOccurrenceDetails(next).endDate.toJSDate();
+        
+        if (vevent.startDate.isDate && vevent.endDate.isDate) {
+          // All-day recurring event
+          const dayOriginalName = getOriginalNameForDate(startDate);
+          const eventContent = formatEventContent(vevent.summary);
 
-      while (currentDate.compare(endDate) <= 0) {
-        const dayOriginalName = getOriginalNameForDate(currentDate.toJSDate());
-        const eventContent = formatEventContent(vevent.summary);
+          eventMap.set(`${dayOriginalName}-${eventContent}`, {
+            pageName: dayOriginalName,
+            content: eventContent,
+            uid: `${uid}-${startDate.toISOString()}`  // Make UID unique for each occurrence
+          });
+        } else {
+          // Timed recurring event
+          const summary = vevent.summary || 'No Title';
+          const startTime = formatTime(startDate);
+          const endTime = formatTime(endDate);
 
-        eventMap.set(`${dayOriginalName}-${eventContent}`, {
-          pageName: dayOriginalName,
+          const eventContent = formatEventContent(summary, startTime, endTime);
+          const originalName = getOriginalNameForDate(startDate);
+
+          eventMap.set(`${originalName}-${eventContent}`, {
+            pageName: originalName,
+            content: eventContent,
+            uid: `${uid}-${startDate.toISOString()}`  // Make UID unique for each occurrence
+          });
+        }
+      }
+    } else {
+      // Original non-recurring event handling
+      if (vevent.startDate.isDate && vevent.endDate.isDate) {
+        let currentDate = vevent.startDate.clone();
+        const endDate = vevent.endDate.clone();
+
+        while (currentDate.compare(endDate) <= 0) {
+          const dayOriginalName = getOriginalNameForDate(currentDate.toJSDate());
+          const eventContent = formatEventContent(vevent.summary);
+
+          eventMap.set(`${dayOriginalName}-${eventContent}`, {
+            pageName: dayOriginalName,
+            content: eventContent,
+            uid
+          });
+
+          currentDate.addDuration(ICAL.Duration.fromString('P1D'));
+        }
+      } else {
+        const summary = vevent.summary || 'No Title';
+        const startTime = formatTime(vevent.startDate.toJSDate());
+        const endTime = vevent.endDate ? formatTime(vevent.endDate.toJSDate()) : '????';
+
+        const eventContent = formatEventContent(summary, startTime, endTime);
+        const originalName = getOriginalNameForDate(vevent.startDate.toJSDate());
+
+        eventMap.set(`${originalName}-${eventContent}`, {
+          pageName: originalName,
           content: eventContent,
           uid
         });
-
-        currentDate.addDuration(ICAL.Duration.fromString('P1D'));
       }
-    } else {
-      const summary = vevent.summary || 'No Title';
-      const startTime = formatTime(vevent.startDate.toJSDate());
-      const endTime = vevent.endDate ? formatTime(vevent.endDate.toJSDate()) : '????';
-
-      const eventContent = formatEventContent(summary, startTime, endTime);
-      const originalName = getOriginalNameForDate(vevent.startDate.toJSDate());
-
-      eventMap.set(`${originalName}-${eventContent}`, {
-        pageName: originalName,
-        content: eventContent,
-        uid
-      });
     }
   }
 
